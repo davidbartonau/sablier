@@ -67,6 +67,14 @@ It provides integrations with multiple reverse proxies and different loading str
 	startCmd.Flags().DurationVar(&conf.Sessions.ExpirationInterval, "sessions.expiration-interval", time.Duration(20)*time.Second, "The expiration checking interval. Higher duration gives less stress on CPU. If you only use sessions of 1h, setting this to 5m is a good trade-off.")
 	_ = viper.BindPFlag("sessions.expiration-interval", startCmd.Flags().Lookup("sessions.expiration-interval"))
 
+	// VRAM-aware eviction flags
+	startCmd.Flags().BoolVar(&conf.VRAM.Enabled, "vram.enabled", false, "Enable VRAM-aware eviction. Containers opt in via the sablier.peak_vram_mb label.")
+	_ = viper.BindPFlag("vram.enabled", startCmd.Flags().Lookup("vram.enabled"))
+	startCmd.Flags().Uint64Var(&conf.VRAM.TotalMB, "vram.total-mb", 0, "Total VRAM budget Sablier manages, in MB. Required when vram.enabled=true.")
+	_ = viper.BindPFlag("vram.total-mb", startCmd.Flags().Lookup("vram.total-mb"))
+	startCmd.Flags().Uint64Var(&conf.VRAM.HeadroomMB, "vram.headroom-mb", 0, "Always-free VRAM buffer kept above the eviction threshold, in MB.")
+	_ = viper.BindPFlag("vram.headroom-mb", startCmd.Flags().Lookup("vram.headroom-mb"))
+
 	// logging level
 	rootCmd.PersistentFlags().StringVar(&conf.Logging.Level, "logging.level", strings.ToLower(slog.LevelInfo.String()), "The logging level. Can be one of [error, warn, info, debug]")
 	_ = viper.BindPFlag("logging.level", rootCmd.PersistentFlags().Lookup("logging.level"))

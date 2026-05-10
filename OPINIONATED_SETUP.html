@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sablier — Opinionated Single-Host Setup</title>
+<style>
+  :root {
+    --fg: #1d2021;
+    --muted: #5a6470;
+    --accent: #0c5b8a;
+    --pass: #1f7a3a;
+    --warn: #a36800;
+    --bg: #fbfaf6;
+    --panel: #ffffff;
+    --border: #d8d3c7;
+    --code-bg: #f3f0e8;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  main {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 48px 28px 96px;
+  }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 {
+    font-size: 21px;
+    margin: 36px 0 12px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+  }
+  h3 {
+    font-size: 16px;
+    margin: 20px 0 8px;
+    color: var(--accent);
+  }
+  p { margin: 0 0 12px; }
+  .subtitle {
+    color: var(--muted);
+    font-size: 15px;
+    margin: 0 0 28px;
+  }
+  .panel {
+    background: var(--panel);
+    border-left: 4px solid var(--accent);
+    padding: 14px 18px;
+    margin: 16px 0 24px;
+    border-radius: 4px;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.04);
+  }
+  .panel.warn { border-left-color: var(--warn); background: #fdf6e7; }
+  .panel.note { border-left-color: var(--pass); }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 8px 0 16px;
+    font-size: 14px;
+    background: var(--panel);
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); font-weight: 600; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 4px;
+    overflow-x: auto;
+    margin: 8px 0 16px;
+    line-height: 1.45;
+  }
+  ul { margin: 8px 0 16px; padding-left: 22px; }
+  li { margin: 3px 0; }
+  .footnote { color: var(--muted); font-size: 13px; }
+  .toc { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 14px 18px; margin: 16px 0 32px; }
+  .toc ol { margin: 0; padding-left: 22px; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Opinionated Sablier Setup</h1>
+<p class="subtitle">
+  A single-host Docker stack that runs a small fixed set of containers on demand,
+  evicting them when memory pressure (typically VRAM) demands it — not when a
+  timeout expires. Designed for AI inference workloads where cold starts are
+  expensive and access patterns are uneven.
+</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#why">Why this exists</a></li>
+    <li><a href="#shape">The shape of the deployment</a></li>
+    <li><a href="#decisions">Why these decisions</a></li>
+    <li><a href="#prereqs">Prerequisites</a></li>
+    <li><a href="#layout">Directory layout</a></li>
+    <li><a href="#stack">The stack: <code>docker-compose.yml</code></a></li>
+    <li><a href="#sablier-config">Sablier configuration</a></li>
+    <li><a href="#nginx-config">nginx configuration</a></li>
+    <li><a href="#models">Your model containers</a></li>
+    <li><a href="#bring-up">Bring it up</a></li>
+    <li><a href="#sizing">Sizing the budget</a></li>
+    <li><a href="#priorities">Setting priorities sensibly</a></li>
+    <li><a href="#operations">Day-to-day operations</a></li>
+    <li><a href="#non-vram">When you have a non-AI service in the mix</a></li>
+    <li><a href="#troubleshooting">Troubleshooting</a></li>
+    <li><a href="#what-this-isnt">What this setup is not</a></li>
+  </ol>
+</div>
+
+<h2 id="why">1. Why this exists</h2>
+
+<p>The upstream Sablier project is a generic scale-to-zero proxy. Its default
+eviction policy is purely time-based: a configurable session timeout fires
+and the container stops. That works fine for "internal admin tools accessed
+once a week," but it falls apart for AI inference workloads where:</p>
+
+<ul>
+  <li>Cold-start cost is large (30–90 s for a 7B LLM, several seconds for Whisper, etc.).</li>
+  <li>Memory (specifically VRAM) is a real, finite, shared budget across multiple model containers.</li>
+  <li>Some containers are hit every few minutes, others once a week, and you want both to behave well.</li>
+</ul>
+
+<p>This fork adds a memory-pressure-aware eviction policy. Containers opt in by
+declaring <code>sablier.peak_vram_mb</code> on their Docker labels. Sablier
+keeps them loaded as long as the declared peaks fit within the configured
+budget. Only when a new request arrives that needs space does Sablier evict
+the lowest-priority loaded container (with oldest-<em>last-used</em> as the
+tie-break). Containers that opt in are <strong>also</strong> exempt from the
+time-based eviction — pressure becomes the only signal that ever stops them.</p>
+
+<p>This document is the opinionated path through that fork: one Docker host,
+nginx in a container, a small fixed set of model containers, blocking-only
+API access. The setup has been verified end-to-end.</p>
+
+<h2 id="shape">2. The shape of the deployment</h2>
+
+<pre>
+                    ┌─────────────────────────────┐
+   curl, SDKs ───▶  │ nginx  (port 8080)          │
+                    │   /api/whisper/    ─┐       │
+                    │   /api/embeddings/ ─┼─auth─┐│
+                    │   /api/llm/         ─┘     ││
+                    └────────────────────────────┘│
+                              │ proxy_pass        │
+                              ▼                   │
+                    ┌────────────────────┐        │
+                    │ model containers   │        │
+                    │  whisper-test:80   │  ◀──── │
+                    │  embed-test:80     │        │
+                    │  llm-test:80       │        │
+                    └────────────────────┘        │
+                              ▲                   │
+                              │ docker start/stop │
+                    ┌─────────┴──────────┐        │
+                    │ sablier (port 10000)│ ◀─────┘
+                    │  /api/strategies/   │  auth_request
+                    │   blocking          │
+                    └────────────────────┘
+                              │ /var/run/docker.sock
+</pre>
+
+<ul>
+  <li><strong>nginx</strong> handles all HTTP routing by path. Each route has an <code>auth_request</code> sub-call to Sablier that blocks until the matching container is ready, then nginx <code>proxy_pass</code>es to the upstream.</li>
+  <li><strong>Sablier</strong> manages the lifecycle of the model containers. It decides who is loaded, who gets evicted, and accounts for VRAM pessimistically against the budget you give it.</li>
+  <li><strong>Model containers</strong> exist (<code>docker create</code>'d, present in <code>docker ps -a</code>) but stay <code>Stopped</code> until Sablier starts them. This is normal Docker behaviour: containers are persistent objects in the daemon's database, separate from being a running process.</li>
+</ul>
+
+<h2 id="decisions">3. Why these decisions</h2>
+
+<table>
+  <thead><tr><th>Decision</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>nginx runs in a container in the same compose file</td>
+      <td>Single Docker network gives clean service-name DNS (<code>nginx → sablier</code>, <code>nginx → whisper-test</code>). Native nginx would force you to publish container ports and route by host IPs — workable but uglier and more brittle on a single host.</td>
+    </tr>
+    <tr>
+      <td>Stock nginx, no plugins or custom builds</td>
+      <td>The Sablier–nginx integration listed in upstream docs is a proxy-wasm plugin requiring a special build. We don't need it: <code>auth_request</code> in stock nginx fires a sub-call to a URL before forwarding, which is exactly the integration we want for blocking-only flows.</td>
+    </tr>
+    <tr>
+      <td>Blocking strategy only (no dynamic / loading page)</td>
+      <td>API clients (curl, OpenAI SDK, Whisper CLI) want a delayed real response, not an HTML interstitial. The dynamic strategy requires a plugin that can render templates; <code>auth_request</code> can't, so we don't try.</td>
+    </tr>
+    <tr>
+      <td>Path-based routing instead of host-based</td>
+      <td>One hostname. No DNS / TLS cert plumbing per service. Easy to put behind a single TLS terminator later if you want.</td>
+    </tr>
+    <tr>
+      <td>Model containers <em>not</em> in the compose file</td>
+      <td>The compose file is the stack. Model containers come and go on a different cadence. Keeping them out of compose means <code>docker compose up</code> never accidentally starts every model at boot. They live as <code>docker create</code>-only entries, only started by Sablier.</td>
+    </tr>
+    <tr>
+      <td>Lazy DNS via <code>resolver</code> in nginx</td>
+      <td>Stock nginx resolves <code>upstream</code> blocks at config-load time. If your model container is <code>Stopped</code> at boot, that resolution would fail and nginx would refuse to start. Variables in <code>proxy_pass</code> + a <code>resolver</code> directive force per-request DNS, which only fires once a request actually arrives — by which time Sablier has started the upstream.</td>
+    </tr>
+    <tr>
+      <td>VRAM accounting is <em>declarative</em>, not measured</td>
+      <td>Sablier doesn't shell out to <code>nvidia-smi</code> or query NVML. You declare <code>peak_vram_mb</code> per container as a worst-case budget. Sablier sums declared peaks against your <code>--vram.total-mb</code>. Pessimistic by design — concurrent decisions can't double-count, and you keep deterministic control over what Sablier thinks the GPU is doing.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="prereqs">4. Prerequisites</h2>
+
+<ul>
+  <li>One Linux host with Docker Engine and the compose plugin (<code>docker compose</code>).</li>
+  <li>The Sablier image with this fork's VRAM patch. Either:
+    <ul>
+      <li>Build from the fork's source: <code>docker build -t sablier:vram-dev -f build/Dockerfile.dev .</code></li>
+      <li>Or push your own tag to a registry and reference it.</li>
+    </ul>
+  </li>
+  <li>Whatever tool you'll actually use the GPU through (vLLM, llama.cpp server, faster-whisper-server, etc.). For this guide, we use stock nginx images as harmless stand-ins so you can verify the wiring before plugging in real model servers.</li>
+</ul>
+
+<h2 id="layout">5. Directory layout</h2>
+
+<pre>/opt/sablier-stack/
+├── docker-compose.yml         # the stack: sablier + nginx
+├── compose.models.yml         # declarative model containers (primary)
+├── create-models.sh           # alternative: bash script using `docker create`
+├── verify.sh                  # smoke tests for the full stack (curl-driven)
+├── mock-model/                # tunable Python mock server for demoing the stack
+│   ├── main.py
+│   └── Dockerfile
+└── nginx/
+    ├── nginx.conf             # global nginx config (resolver, timeouts)
+    └── conf.d/
+        └── server.conf        # per-route auth_request + proxy_pass</pre>
+
+<p>A working copy is in the repo at
+<code>examples/opinionated-single-host/</code>. The blocks below show the
+same content inline so this guide is self-contained.</p>
+
+<h2 id="stack">6. The stack: <code>docker-compose.yml</code></h2>
+
+<pre>name: sablier-stack
+
+services:
+  sablier:
+    image: sablier:vram-dev
+    container_name: sablier
+    restart: unless-stopped
+    networks: [sablier-net]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - start
+      - --provider.name=docker
+      - --provider.auto-stop-on-startup=true
+      - --logging.level=info
+      - --vram.enabled
+      - --vram.total-mb=8000          # adjust to your GPU
+      - --vram.headroom-mb=500
+      - --sessions.expiration-interval=2s
+      - --strategy.blocking.default-timeout=120s
+      - --strategy.blocking.default-refresh-frequency=500ms
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: sablier-nginx
+    restart: unless-stopped
+    depends_on: [sablier]
+    networks: [sablier-net]
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+
+networks:
+  sablier-net:
+    driver: bridge
+    name: sablier-net</pre>
+
+<div class="panel warn">
+  <strong>Why <code>auto-stop-on-startup=true</code>?</strong> When Sablier
+  starts, it scans every container with <code>sablier.enable=true</code>. If
+  any are running, it stops them so the system starts in a known clean
+  state. If you have model containers you want to be running at boot
+  regardless, set this to <code>false</code> and start them manually.
+</div>
+
+<h2 id="sablier-config">7. Sablier configuration knobs</h2>
+
+<table>
+  <thead><tr><th>Flag</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>--vram.enabled</code></td><td>Turns on the patched eviction policy. Without this flag the fork behaves identically to upstream Sablier (time-based eviction only).</td></tr>
+    <tr><td><code>--vram.total-mb=N</code></td><td>The VRAM budget Sablier will manage. Set it to <em>what's available to Sablier-managed containers</em>, not necessarily the GPU's installed memory. If another process always uses 4 GB, subtract it.</td></tr>
+    <tr><td><code>--vram.headroom-mb=N</code></td><td>Always-free buffer kept above the eviction threshold. Eviction triggers when free &lt; new-peak + headroom. 5–10% of total is typical.</td></tr>
+    <tr><td><code>--sessions.expiration-interval=2s</code></td><td>How often Sablier scans for expired non-participants. For non-participants this is the resolution of TTL eviction. Keep it short.</td></tr>
+    <tr><td><code>--strategy.blocking.default-timeout=120s</code></td><td>Maximum time a blocking call waits before returning 500. Set this longer than your slowest cold start. Per-request override available via <code>?timeout=</code>.</td></tr>
+    <tr><td><code>--strategy.blocking.default-refresh-frequency=500ms</code></td><td>How often Sablier polls the container's status during a blocking call. 500 ms is a good balance.</td></tr>
+  </tbody>
+</table>
+
+<p>All flags can be set via <code>SABLIER_*</code> environment variables or in
+<code>/etc/sablier/sablier.yaml</code>. See <code>sablier.sample.yaml</code>.</p>
+
+<h2 id="nginx-config">8. nginx configuration</h2>
+
+<h3>nginx/nginx.conf</h3>
+
+<pre>user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Long timeouts because the auth_request subrequest blocks while
+    # Sablier waits for the model to become healthy. Match this to your
+    # slowest model's cold-start time (LLMs commonly take 30–90 s).
+    proxy_connect_timeout 10s;
+    proxy_send_timeout    180s;
+    proxy_read_timeout    180s;
+
+    log_format main '$remote_addr [$time_local] "$request" '
+                    '$status $body_bytes_sent rt=$request_time '
+                    'upstream=$upstream_addr ut=$upstream_response_time';
+    access_log /var/log/nginx/access.log main;
+
+    # Sablier API. Used only as the auth_request target.
+    upstream sablier_api { server sablier:10000; }
+
+    # Per-model upstreams are NOT defined as upstream {} blocks — see comment
+    # in conf.d/server.conf. Lazy DNS via Docker's embedded resolver.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    include /etc/nginx/conf.d/*.conf;
+}</pre>
+
+<h3>nginx/conf.d/server.conf</h3>
+
+<pre>server {
+    listen 80;
+    server_name _;
+
+    # Health endpoint — verify nginx without waking anything.
+    location = /healthz {
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+
+    # ─── /api/whisper/ → whisper-test ────────────────────────────────────
+    location /api/whisper/ {
+        auth_request /_sablier_whisper;
+        # Variable in proxy_pass = lazy DNS via the `resolver` directive in
+        # nginx.conf. Lets nginx start even when the upstream is Stopped.
+        set $whisper_up "whisper-test:80";
+        proxy_pass http://$whisper_up/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location = /_sablier_whisper {
+        internal;
+        proxy_pass http://sablier_api/api/strategies/blocking?names=whisper-test&amp;session_duration=2h&amp;timeout=120s;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+
+    # ─── /api/embeddings/ → embed-test ───────────────────────────────────
+    location /api/embeddings/ {
+        auth_request /_sablier_embed;
+        set $embed_up "embed-test:80";
+        proxy_pass http://$embed_up/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location = /_sablier_embed {
+        internal;
+        proxy_pass http://sablier_api/api/strategies/blocking?names=embed-test&amp;session_duration=2h&amp;timeout=120s;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+
+    # ─── /api/llm/ → llm-test ────────────────────────────────────────────
+    location /api/llm/ {
+        auth_request /_sablier_llm;
+        set $llm_up "llm-test:80";
+        proxy_pass http://$llm_up/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location = /_sablier_llm {
+        internal;
+        proxy_pass http://sablier_api/api/strategies/blocking?names=llm-test&amp;session_duration=2h&amp;timeout=120s;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+}</pre>
+
+<div class="panel">
+  <strong>Pattern.</strong> Each route is two <code>location</code> blocks:
+  the public one with <code>auth_request</code>, and an internal helper
+  that calls Sablier. To add a new model, copy the pair, change the path,
+  the <code>names=</code> parameter, and the upstream variable. Reload
+  nginx with <code>docker compose exec sablier-nginx nginx -s reload</code>.
+</div>
+
+<h2 id="models">9. Your model containers</h2>
+
+<p>Model containers are <strong>not</strong> in the main
+<code>docker-compose.yml</code> — that's the stack itself. The models live
+in their own compose file and are brought up <em>without starting</em>:
+they exist in Docker's database (visible to Sablier) but stay
+<code>Stopped</code> until Sablier wakes them.</p>
+
+<h3>The mock model server (for demos and integration testing)</h3>
+
+<p>To exercise the full stack without needing a real GPU, the example ships
+a tiny single-file Python service that simulates a model server. It has a
+configurable <strong>startup time</strong> (per-container, via env var) so
+you can demonstrate cold-start latency, eviction timing, and recovery —
+behaviour that nginx-as-stand-in can't show.</p>
+
+<h4>mock-model/main.py</h4>
+
+<pre>"""Mock model service for the Sablier opinionated stack.
+
+Simulates a model server's lifecycle:
+  1. On startup: sleep STARTUP_SECONDS to simulate weight loading.
+  2. Once "loaded": start the HTTP server and respond 200 to /health.
+  3. /          - identifying string with model name and configured delays.
+  4. /infer     - sleeps INFERENCE_SECONDS, then returns the same string.
+  5. /health    - 200 OK once loaded; 503 while still warming up.
+
+Configurable via environment variables (with defaults):
+  MODEL_NAME=mock-model
+  STARTUP_SECONDS=3
+  INFERENCE_SECONDS=0
+  PORT=80
+"""
+
+# (full source in examples/opinionated-single-host/mock-model/main.py)</pre>
+
+<h4>mock-model/Dockerfile</h4>
+
+<pre>FROM python:3.12-alpine
+WORKDIR /app
+COPY main.py /app/main.py
+EXPOSE 80
+CMD ["python", "main.py"]</pre>
+
+<p>Build the image once:</p>
+
+<pre>docker build -t mock-model:latest mock-model/</pre>
+
+<h3>compose.models.yml — declarative model definitions</h3>
+
+<p>Each model is one service in <code>compose.models.yml</code>. The
+<strong>startup time and inference time are env-var parameters</strong>
+on the container, set per service so each model behaves differently —
+exactly what you want when comparing eviction strategies. Replace
+<code>image: mock-model:latest</code> with your real model server's image
+when wiring this up for production. The Sablier labels and the
+healthcheck shape are what matters; the image is yours.</p>
+
+<pre>name: sablier-models
+
+x-model: &amp;model-defaults
+  image: mock-model:latest
+  networks: [sablier-net]
+  restart: "no"
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/health &gt;/dev/null 2&gt;&amp;1 || exit 1"]
+    interval: 1s
+    timeout: 2s
+    retries: 3
+    start_period: 1s
+
+services:
+  whisper-test:
+    &lt;&lt;: *model-defaults
+    container_name: whisper-test
+    environment:
+      MODEL_NAME: whisper-test
+      STARTUP_SECONDS: "3"        # &lt;-- per-container parameter
+      INFERENCE_SECONDS: "0.5"
+    labels:
+      sablier.enable: "true"
+      sablier.group: "models"
+      sablier.peak_vram_mb: "2000"
+      sablier.priority: "10"
+
+  embed-test:
+    &lt;&lt;: *model-defaults
+    container_name: embed-test
+    environment:
+      MODEL_NAME: embed-test
+      STARTUP_SECONDS: "5"
+      INFERENCE_SECONDS: "0.2"
+    labels:
+      sablier.enable: "true"
+      sablier.group: "models"
+      sablier.peak_vram_mb: "4000"
+      sablier.priority: "50"
+
+  llm-test:
+    &lt;&lt;: *model-defaults
+    container_name: llm-test
+    environment:
+      MODEL_NAME: llm-test
+      STARTUP_SECONDS: "8"        # bigger model, slower cold start
+      INFERENCE_SECONDS: "1.5"
+    labels:
+      sablier.enable: "true"
+      sablier.group: "models"
+      sablier.peak_vram_mb: "5000"
+      sablier.priority: "80"
+
+networks:
+  sablier-net:
+    name: sablier-net
+    external: true</pre>
+
+<p>Materialise the containers (the <code>--no-start</code> flag is the
+critical bit — they're created but not started):</p>
+
+<pre>docker compose -f compose.models.yml up --no-start
+
+# Verify they exist but are stopped:
+docker ps -a --filter 'name=^/(whisper|embed|llm)-test$' \
+  --format 'table {{.Names}}\t{{.Status}}'</pre>
+
+<div class="panel">
+  <strong>Why <code>external: true</code>?</strong> The
+  <code>sablier-net</code> network is created by the main stack
+  (<code>docker-compose.yml</code>). Declaring it as external in
+  <code>compose.models.yml</code> means compose will reuse the existing
+  network instead of trying to create a second one. Bring up the main
+  stack first.
+</div>
+
+<div class="panel warn">
+  <strong>Healthcheck gotcha.</strong> Use <code>http://127.0.0.1/</code>
+  rather than <code>http://localhost/</code>. Alpine resolves
+  <code>localhost</code> to <code>::1</code> first, and most model servers
+  (including stock nginx and the mock-model service) listen on IPv4 only.
+  Sablier marks a Status=Running but Health=Unhealthy container as
+  <em>error</em>, not ready, so the request will time out at 500 even
+  though the container is fine.
+</div>
+
+<h3>For your real models</h3>
+
+<p>Replace the <code>image:</code> field with your real model server's
+image. The labels and healthcheck shape stay the same:</p>
+
+<ul>
+  <li><code>sablier.enable=true</code> — required to register with Sablier.</li>
+  <li><code>sablier.group=models</code> — optional; lets you start multiple containers as a unit via <code>?group=</code> on the API.</li>
+  <li><code>sablier.peak_vram_mb=N</code> — opt-in to VRAM management. Without this label, the container falls back to plain time-based eviction.</li>
+  <li><code>sablier.priority=N</code> — lower = evict first. Default 50.</li>
+  <li><code>healthcheck:</code> — Sablier reports Ready only when the container is healthy. Without a healthcheck, Sablier assumes ready as soon as the container is Running, which is usually premature for model servers that take seconds to load weights.</li>
+</ul>
+
+<h3>create-models.sh — alternative one-liner approach</h3>
+
+<p>If you'd rather not maintain a second compose file, an equivalent bash
+script is in the example directory at <code>create-models.sh</code>. It
+uses <code>docker create</code> directly. Functionally identical, just
+less declarative. Pick whichever feels more natural for your operations
+workflow.</p>
+
+<h2 id="bring-up">10. Bring it up</h2>
+
+<pre>cd /opt/sablier-stack
+
+# 1. Build the mock-model image (skip if you're using real model images)
+docker build -t mock-model:latest mock-model/
+
+# 2. Start the stack (Sablier + nginx). This also creates the sablier-net network.
+docker compose up -d
+
+# 3. Materialize the model containers without starting them.
+docker compose -f compose.models.yml up --no-start
+
+# Verify nginx is up
+curl http://localhost:8080/healthz
+# → ok
+
+# Trigger a cold start of whisper-test (STARTUP_SECONDS=3, plus healthcheck delay)
+curl http://localhost:8080/api/whisper/
+# → Hello from whisper-test (startup=3.0s, infer=0.5s)
+
+# Force an eviction — the three declared peaks (2000+4000+5000=11000) exceed
+# the 8000 MB budget, so requesting llm-test evicts the lowest-priority loaded models.
+curl http://localhost:8080/api/embeddings/
+curl http://localhost:8080/api/llm/
+docker logs sablier 2&gt;&amp;1 | grep evicting
+# evicting instance for VRAM pressure victim=whisper-test for=llm-test</pre>
+
+<p>Each model's startup time is independent: whisper-test is "ready" in
+~3 s, embed-test in ~5 s, llm-test in ~8 s. Tweak the
+<code>STARTUP_SECONDS</code> values in <code>compose.models.yml</code> to
+match the cold-start cost of your real models.</p>
+
+<p>A <code>verify.sh</code> script next to the compose file runs the same
+sequence as smoke tests with assertions. Use it after first bring-up or
+after changes:</p>
+
+<pre>./verify.sh
+# Summary: PASS=8  FAIL=0</pre>
+
+<div class="panel">
+  <strong>SIGTERM matters.</strong> Eviction speed is bounded by how fast
+  your model server stops. Containers that ignore SIGTERM force Docker to
+  wait the full <code>--stop-grace-period</code> (default 10 s) per
+  container before SIGKILL. With three concurrent evictions, that's 30 s
+  of artificial latency. The mock service in this example installs a
+  SIGTERM handler so it stops promptly; your real model servers should
+  too. Alternatively, set <code>stop_grace_period: 2s</code> in the
+  service block to bound the wait.
+</div>
+
+<h2 id="sizing">11. Sizing the budget</h2>
+
+<p>Two values to set: <code>--vram.total-mb</code> and <code>--vram.headroom-mb</code>.</p>
+
+<p><strong>Total.</strong> Set this to what's available <em>to Sablier-managed
+containers</em>. If you have a 24 GB GPU and a long-running process always
+uses 4 GB outside Sablier's control, set <code>total=20000</code>. Sablier
+doesn't measure; it accounts.</p>
+
+<p><strong>Headroom.</strong> A buffer that absorbs imprecision. Reasons it matters:</p>
+
+<ul>
+  <li>Real VRAM consumption can briefly exceed declared peak during model warm-up (KV cache filling, framework allocations).</li>
+  <li>If a request arrives while a previously-evicted container is still in the process of stopping, the freed VRAM may not yet be available to the GPU driver.</li>
+  <li>Padding lets you avoid OOM-kills caused by these timing windows.</li>
+</ul>
+
+<p>5–10% of total is reasonable. For a 24 GB card with serious models, 1500 MB is comfortable.</p>
+
+<h2 id="priorities">12. Setting priorities sensibly</h2>
+
+<p>Priority is an integer; lower values get evicted first. The eviction algorithm sorts by <code>(priority asc, last_used asc)</code>, so:</p>
+
+<ul>
+  <li>Two containers, same priority, the one used least recently goes first.</li>
+  <li>Two containers, different priority, lower priority goes first regardless of recency.</li>
+</ul>
+
+<p>A pragmatic schema:</p>
+
+<table>
+  <thead><tr><th>Priority</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td>10</td><td>Cheap-to-restart, infrequently used. (e.g. small embedding models, Whisper-tiny.)</td></tr>
+    <tr><td>30</td><td>Mid-cost restart. (e.g. medium models, faster-whisper-base.)</td></tr>
+    <tr><td>50 (default)</td><td>Average, no strong preference.</td></tr>
+    <tr><td>70</td><td>Expensive cold start, used regularly. (e.g. 7B–13B LLMs.)</td></tr>
+    <tr><td>90</td><td>Very expensive cold start, you really want this kept loaded. (e.g. 70B LLMs, large multi-modal models.)</td></tr>
+  </tbody>
+</table>
+
+<p>Reserve 100 for "must not be evicted unless absolutely no other option" — note that even a priority-100 container <em>can</em> be evicted if it's the only candidate left and the request truly needs the space. The algorithm returns an error only when evicting <em>everything</em> wouldn't be enough.</p>
+
+<h2 id="operations">13. Day-to-day operations</h2>
+
+<h3>Adding a new model</h3>
+
+<ol>
+  <li>Add an <code>auth_request</code> + <code>location</code> pair to <code>nginx/conf.d/server.conf</code>.</li>
+  <li>Add a service block to <code>compose.models.yml</code> (or a <code>create_model</code> line to <code>create-models.sh</code> if you took the bash path).</li>
+  <li>Materialise the new container: <code>docker compose -f compose.models.yml up --no-start</code>.</li>
+  <li>Reload nginx: <code>docker compose exec sablier-nginx nginx -s reload</code>.</li>
+  <li>Verify: <code>curl http://localhost:8080/api/&lt;new-path&gt;/</code>.</li>
+</ol>
+
+<h3>Updating an existing model image</h3>
+
+<pre>docker pull yourorg/whisper:newtag
+
+# Edit compose.models.yml to bump the image tag, then force a recreate
+# (compose detects the image change and updates the stopped container):
+docker compose -f compose.models.yml up --no-start --force-recreate whisper-test</pre>
+
+<p>Sablier picks up the new container labels on its next event-stream notification (sub-second). No Sablier restart needed.</p>
+
+<h3>Restarting Sablier without losing state</h3>
+
+<p>Sablier's in-memory store doesn't persist. Restart drops state, but the
+<code>auto-stop-on-startup=true</code> behaviour will stop any currently
+running model containers as a clean reset. The next request to nginx will
+cold-start them again. This is intentional and safe — there's nothing to
+lose because Sablier was the source of truth, and the docker daemon still
+remembers the containers exist.</p>
+
+<h3>Logs to watch</h3>
+
+<pre>docker logs -f sablier        # eviction decisions, request handling
+docker logs -f sablier-nginx  # access log + auth_request errors
+docker stats                  # actual resource usage</pre>
+
+<h2 id="non-vram">14. When you have a non-AI service in the mix</h2>
+
+<p>If you also run a small admin tool, a Whisper UI, or anything else that
+doesn't need VRAM, <strong>don't</strong> give it
+<code>sablier.peak_vram_mb</code>. Just set <code>sablier.enable=true</code>.
+That container then:</p>
+
+<ul>
+  <li>Doesn't count against the VRAM budget.</li>
+  <li>Doesn't trigger eviction of others.</li>
+  <li>Can't be evicted by pressure.</li>
+  <li>Falls back to time-based eviction, expiring per the route's <code>session_duration</code>.</li>
+</ul>
+
+<p>Pair it with a shorter <code>session_duration</code> in the auth_request URL (e.g. <code>session_duration=10m</code>) so it actually cleans up.</p>
+
+<h2 id="troubleshooting">15. Troubleshooting</h2>
+
+<h3>nginx returns 500 "auth request unexpected status" — POSTs only</h3>
+
+<p>If GETs work but POSTs (file uploads, JSON bodies) return 500 in well
+under a second, sablier is rejecting the auth_request with HTTP 400
+"Validation Failed." nginx's <code>auth_request</code> module forwards
+the original request method and <code>Content-Type</code> to the auth
+upstream by default. With <code>proxy_pass_request_body off;</code> the
+body is dropped, but if the original request was a POST with
+<code>Content-Type: multipart/form-data</code>, sablier's gin binder
+tries to parse a body that isn't there and returns 400.</p>
+
+<p>Fix: force every auth_request to look like a clean GET regardless of
+the original method. Add to each internal <code>_sablier_*</code>
+location:</p>
+
+<pre>proxy_method GET;
+proxy_set_header Content-Type "";</pre>
+
+<p>This is in the example <code>server.conf</code>. If you wrote your own
+nginx config from scratch, copy these two lines.</p>
+
+<h3>Upstream model receives the wrong path (404 or unexpected 405)</h3>
+
+<p>Symptom: GETs work, POSTs come back as 405 "Method Not Allowed" with a
+JSON body from the model server, or you see the upstream container's
+log show requests against the location prefix instead of the stripped
+path (e.g. <code>POST /api/whisper/asr</code> instead of
+<code>POST /asr</code>).</p>
+
+<p>Cause: <code>proxy_pass</code> with a variable doesn't strip the
+location prefix the way <code>proxy_pass</code> with a literal does. The
+trailing-slash trick only works with literal upstreams.</p>
+
+<pre># DOES NOT strip the prefix (variable + trailing slash):
+location /api/whisper/ {
+    set $whisper_up "whisper-test:80";
+    proxy_pass http://$whisper_up/;     # whisper sees /api/whisper/foo
+}
+
+# DOES strip the prefix (variable + explicit rewrite):
+location /api/whisper/ {
+    set $whisper_up "whisper-test:80";
+    rewrite ^/api/whisper/(.*)$ /$1 break;
+    proxy_pass http://$whisper_up;      # whisper sees /foo
+}</pre>
+
+<p>Use the second form whenever you need a variable (which you do, for
+lazy DNS). Mock-model servers with a catch-all root handler will hide
+this bug — symptoms only appear when you swap to a real model that has
+specific routes.</p>
+
+<h3>nginx returns 500 "auth request unexpected status" — GETs too</h3>
+
+<p>The auth_request returned a non-2xx response. Cause is almost always one of:</p>
+
+<ul>
+  <li>The model container's healthcheck never goes Healthy. Check <code>docker inspect &lt;name&gt; --format '{{json .State.Health}}'</code>. The IPv6 trap (<code>localhost</code>→<code>::1</code>) is the most common.</li>
+  <li>Sablier's blocking timeout (<code>?timeout=</code> in the URL, default 120 s) is shorter than the cold-start time. Bump it.</li>
+  <li>The container failed to start at all (image missing, command broken). Check <code>docker logs &lt;name&gt;</code>.</li>
+</ul>
+
+<h3>Insufficient VRAM error on a request</h3>
+
+<p>You'll see an HTTP 500 with a body like:</p>
+
+<pre>{"detail":"... insufficient VRAM and no further eviction candidates: need 20500 MB (incl 500 headroom), can free at most 8000 MB", ...}</pre>
+
+<p>The requested container's declared peak (plus headroom) exceeds your total budget even with everything else evicted. Either bump <code>--vram.total-mb</code> (if you have the actual hardware) or fix the container's <code>peak_vram_mb</code> if it's overstated.</p>
+
+<h3>Container stays unhealthy</h3>
+
+<p>Check the healthcheck command works inside the container:</p>
+
+<pre>docker start whisper-test
+docker exec whisper-test wget -q -O - http://127.0.0.1/
+docker stop whisper-test</pre>
+
+<h3>nginx can't resolve the upstream</h3>
+
+<p>If the upstream container has been removed, nginx will return 502 because the variable in <code>proxy_pass</code> doesn't resolve. Re-create with <code>docker compose -f compose.models.yml up --no-start</code> (or <code>./create-models.sh</code> if you took the bash path).</p>
+
+<h2 id="what-this-isnt">16. What this setup is <em>not</em></h2>
+
+<ul>
+  <li><strong>Multi-host.</strong> One Sablier per Docker host. For a cluster, switch to the Kubernetes provider — but that's outside this opinionated path.</li>
+  <li><strong>HA.</strong> Single nginx, single Sablier. If either dies, traffic fails. Use a process supervisor or compose's <code>restart: unless-stopped</code> as a band-aid.</li>
+  <li><strong>For browser users with loading pages.</strong> The dynamic strategy (HTML interstitial) needs a proxy plugin that can render templates. <code>auth_request</code> can't. If you need that for browser-facing UIs, switch to Traefik with the official Sablier plugin.</li>
+  <li><strong>Auto-detecting GPU memory.</strong> You set <code>--vram.total-mb</code> by hand. Auto-detection via <code>nvidia-smi</code> would be ~20 lines but it's not in this build, deliberately — you usually want manual control on shared GPUs anyway.</li>
+</ul>
+
+<p class="footnote">End of guide. For the underlying design rationale and test report covering the eviction algorithm itself, see <code>VRAM_TEST_REPORT.html</code>.</p>
+
+</main>
+</body>
+</html>

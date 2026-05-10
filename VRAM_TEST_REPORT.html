@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sablier VRAM-Aware Eviction — Test Report</title>
+<style>
+  :root {
+    --fg: #1d2021;
+    --muted: #5a6470;
+    --accent: #0c5b8a;
+    --pass: #1f7a3a;
+    --fail: #b3261e;
+    --bg: #fbfaf6;
+    --panel: #ffffff;
+    --border: #d8d3c7;
+    --code-bg: #f3f0e8;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 48px 24px 96px;
+  }
+  h1 {
+    font-size: 28px;
+    margin: 0 0 8px;
+    letter-spacing: -0.01em;
+  }
+  h2 {
+    font-size: 19px;
+    margin: 36px 0 12px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+  }
+  h3 {
+    font-size: 15px;
+    margin: 20px 0 6px;
+    color: var(--accent);
+  }
+  p { margin: 0 0 12px; }
+  .meta {
+    color: var(--muted);
+    font-size: 14px;
+    margin-bottom: 24px;
+  }
+  .meta dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: 16px;
+    row-gap: 2px;
+    margin: 0;
+  }
+  .meta dt { color: var(--muted); }
+  .meta dd { margin: 0; }
+  .tldr {
+    background: var(--panel);
+    border-left: 4px solid var(--pass);
+    padding: 12px 16px;
+    margin: 16px 0 32px;
+    border-radius: 4px;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.04);
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 8px 0 16px;
+    font-size: 14px;
+    background: var(--panel);
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+  }
+  td.pass { color: var(--pass); font-weight: 600; }
+  td.fail { color: var(--fail); font-weight: 600; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 12px 14px;
+    border-radius: 4px;
+    overflow-x: auto;
+    margin: 8px 0 16px;
+    font-size: 12.5px;
+    line-height: 1.45;
+  }
+  ul { margin: 8px 0 16px; padding-left: 22px; }
+  li { margin: 3px 0; }
+  .scenario {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--pass);
+    border-radius: 4px;
+    padding: 14px 18px;
+    margin: 12px 0;
+  }
+  .scenario.fail { border-left-color: var(--fail); }
+  .scenario h3 { margin-top: 0; }
+  .scenario .verdict { float: right; font-weight: 700; color: var(--pass); }
+  .scenario.fail .verdict { color: var(--fail); }
+  .matrix th, .matrix td { text-align: center; }
+  .matrix th:first-child, .matrix td:first-child { text-align: left; }
+  .footnote { color: var(--muted); font-size: 13px; }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 32px 0; }
+  .toc {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 14px 18px;
+    margin: 16px 0 32px;
+  }
+  .toc strong { display: block; margin-bottom: 6px; }
+  .toc ol { margin: 0; padding-left: 22px; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Sablier VRAM-Aware Eviction — Test Report</h1>
+
+<div class="meta">
+  <dl>
+    <dt>Date</dt><dd>2026-05-09</dd>
+    <dt>Test host</dt><dd>redacted — Ubuntu 24.04 LTS, x86_64, 4 vCPU, 3.2 GiB RAM</dd>
+    <dt>Branch</dt><dd><code>main</code> + VRAM-aware eviction patch (uncommitted)</dd>
+    <dt>Toolchain</dt><dd>Go 1.26.0, Docker CE 29.4.3</dd>
+    <dt>Test artefacts</dt><dd><code>examples/opinionated-single-host/integration-tests/{run.sh,helpers.sh}</code> (in-repo)</dd>
+  </dl>
+</div>
+
+<div class="tldr">
+  <strong>All 9 integration scenarios pass.</strong> All unit tests across changed packages pass (12/12 packages green, no regressions). The eviction policy now matches the design: opt-in via the <code>sablier.peak_vram_mb</code> label, on-demand only, lowest-priority-first with oldest-<code>LastUsed</code> tie-break, refusal when impossible, and — per the corrected design — <em>participants are immune from TTL eviction</em>.
+</div>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#matrix">Behavioural matrix</a></li>
+    <li><a href="#toolchain">Toolchain</a></li>
+    <li><a href="#unit-tests">Unit test results</a></li>
+    <li><a href="#scenarios">Integration scenarios</a></li>
+    <li><a href="#gaps">Things not yet covered</a></li>
+    <li><a href="#reproducing">Reproducing</a></li>
+    <li><a href="#artefacts">Build artefacts</a></li>
+    <li><a href="#recommendation">Recommendation</a></li>
+  </ol>
+</div>
+
+<h2 id="matrix">Behavioural Matrix (corrected)</h2>
+
+<table class="matrix">
+  <thead>
+    <tr>
+      <th>Container has <code>peak_vram_mb</code>?</th>
+      <th>Pressure-evicted?</th>
+      <th>TTL-evicted?</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>No (default)</td>
+      <td>No</td>
+      <td>Yes — pre-existing behaviour preserved</td>
+    </tr>
+    <tr>
+      <td>Yes</td>
+      <td>Yes (when needed)</td>
+      <td><strong>No</strong> — pressure is the only stop signal</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Declaring <code>peak_vram_mb</code> opts the container into the pressure-based system <em>and out of</em> the time-based system. The <code>sessions.default-duration</code> and per-request <code>session_duration</code> are silently ignored for participants — replaced with a 100-year sentinel so the existing TTL machinery never fires for them. This matches the intent of "keep things loaded as long as there's room; only evict under pressure."</p>
+
+<h2 id="toolchain">Toolchain</h2>
+
+<table>
+  <thead><tr><th>Item</th><th>Version</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Go</td><td>1.26.0</td><td>Matched <code>go.mod</code>; installed from official tarball into <code>/usr/local/go</code>.</td></tr>
+    <tr><td>Docker CE</td><td>29.4.3</td><td>Installed from <code>download.docker.com</code> APT repo for Noble.</td></tr>
+    <tr><td>Sablier</td><td>main + patch</td><td>Built with <code>go build -buildvcs=false ./cmd/sablier</code>; ~91 MB binary.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="unit-tests">Unit Test Results</h2>
+
+<pre>go test -short -count=1 ./...</pre>
+
+<table>
+  <thead><tr><th>Package</th><th>Result</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>internal/api</code></td><td class="pass">OK</td><td></td></tr>
+    <tr><td><code>pkg/config</code></td><td class="pass">OK</td><td></td></tr>
+    <tr><td><code>pkg/provider/docker</code></td><td class="pass">OK</td><td>InstanceInfo struct change is non-breaking (new fields populated only when <code>peak_vram_mb</code> label is set).</td></tr>
+    <tr><td><code>pkg/provider/dockerswarm</code></td><td class="pass">OK</td><td></td></tr>
+    <tr><td><code>pkg/provider/kubernetes</code></td><td class="pass">OK</td><td></td></tr>
+    <tr><td><code>pkg/provider/podman</code></td><td class="pass">OK</td><td></td></tr>
+    <tr><td><code>pkg/sablier</code></td><td class="pass">OK</td><td>15 new <code>TestVRAM_*</code> tests + existing <code>TestInstanceRequest_*</code> all pass.</td></tr>
+    <tr><td><code>pkg/sabliercmd</code></td><td class="pass">OK</td><td>Golden config files updated to include <code>VRAM</code> block.</td></tr>
+    <tr><td><code>pkg/store/inmemory</code></td><td class="pass">OK</td><td>Added <code>InMemoryListReturnsLoadedWithRecency</code> and <code>InMemoryListAfterDeleteOmits</code>.</td></tr>
+    <tr><td><code>pkg/store/valkey</code></td><td class="pass">OK</td><td><code>List</code> stub returns <code>ErrListUnsupported</code>.</td></tr>
+    <tr><td><code>pkg/theme</code></td><td class="pass">OK</td><td></td></tr>
+    <tr><td><code>pkg/tinykv</code></td><td class="pass">OK</td><td>Untouched.</td></tr>
+  </tbody>
+</table>
+
+<h3>VRAM unit tests (15 / 15 pass)</h3>
+
+<ul>
+  <li><code>TestVRAM_NonParticipantIsNoOp</code> — peak=0 returns no victims and no state mutation.</li>
+  <li><code>TestVRAM_DisabledByNilManager</code> — sanity for nil-manager construction.</li>
+  <li><code>TestVRAM_ReservesWhenSpaceAvailable</code> — no eviction when budget fits.</li>
+  <li><code>TestVRAM_HeadroomTriggersEviction</code> — headroom factored into available calculation.</li>
+  <li><code>TestVRAM_EvictsLowestPriorityFirst</code> — primary sort key.</li>
+  <li><code>TestVRAM_TieBreaksByOldestLastUsed</code> — secondary sort key when priorities tie.</li>
+  <li><code>TestVRAM_EvictsMultipleUntilEnoughFreed</code> — loop accumulates victims until threshold met.</li>
+  <li><code>TestVRAM_RefusesWhenInsufficientEvenAfterAllEvictions</code> — <code>ErrInsufficientVRAM</code> with no state change.</li>
+  <li><code>TestVRAM_NonParticipantsNotSelectedAsVictims</code> — peak=0 instances skipped from candidate list.</li>
+  <li><code>TestVRAM_ConfirmFreedReleasesPendingFreeSlot</code> — state transition on stop completion.</li>
+  <li><code>TestVRAM_ConfirmLoadedReleasesPendingReserveSlot</code> — state transition on start success.</li>
+  <li><code>TestVRAM_AbortReserveReleasesPendingReserveSlot</code> — state transition on start failure.</li>
+  <li><code>TestVRAM_ConcurrentReservesDoNotDoubleCount</code> — sequential <code>Plan</code> calls account for prior <code>pendingReserve</code>.</li>
+  <li><code>TestVRAM_VictimAlreadyBeingFreedIsNotPickedAgain</code> — <code>pendingFree</code> excludes a candidate from re-selection.</li>
+  <li><code>TestVRAM_AccountingRespectsTotal</code> — <code>TotalMB</code> / <code>HeadroomMB</code> getters.</li>
+</ul>
+
+<h3>Defects found and fixed during testing</h3>
+
+<ul>
+  <li><strong>Initial test expectation in <code>TestVRAM_VictimAlreadyBeingFreedIsNotPickedAgain</code> was wrong.</strong> peak=7000 against 2000 available legitimately requires evicting both candidates (4000+4000); the test asserted a single eviction. Adjusted to peak=5000 so a single 4000 MB eviction satisfies, exposing the real property under test.</li>
+  <li><strong>Golden config files in <code>pkg/sabliercmd/testdata/</code> didn't include the new <code>VRAM</code> block.</strong> Updated all four (<code>config_default.json</code>, <code>config_yaml_wanted.json</code>, <code>config_env_wanted.json</code>, <code>config_cli_wanted.json</code>).</li>
+  <li><strong>Initial design TTL-evicted participants too.</strong> Corrected per design feedback: participants now bypass TTL entirely. Implemented in <code>pkg/sablier/instance_request.go</code> by overriding the store-side duration to a 100-year sentinel for any state with <code>PeakVRAMMB &gt; 0</code> when VRAM management is enabled.</li>
+</ul>
+
+<h2 id="scenarios">Integration Scenarios</h2>
+
+<p>Test harness: <code>examples/opinionated-single-host/integration-tests/run.sh</code>. Each scenario starts from a clean state (Sablier killed, <code>sab-test-*</code> containers removed), creates the per-scenario set, starts Sablier with <code>--vram.enabled --vram.total-mb=8000 --vram.headroom-mb=500</code>, then drives <code>GET /api/strategies/blocking?names=…</code> to trigger starts. Containers are <code>nginx:alpine</code> with healthchecks so Sablier can detect ready.</p>
+
+<table>
+  <thead><tr><th>#</th><th>Scenario</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>S1</td><td>Non-participant (no peak label) starts and TTL-expires</td><td class="pass">PASS</td></tr>
+    <tr><td>S2</td><td>Single participant within budget loads with no eviction</td><td class="pass">PASS</td></tr>
+    <tr><td>S3</td><td>Three participants fit within budget, all stay loaded</td><td class="pass">PASS</td></tr>
+    <tr><td>S4</td><td>Pressure evicts the lowest-priority participant</td><td class="pass">PASS</td></tr>
+    <tr><td>S5</td><td>Tie-break by oldest <code>LastUsed</code> when priorities are equal</td><td class="pass">PASS</td></tr>
+    <tr><td>S6</td><td>Request exceeding total VRAM is refused with HTTP 500 and a clear message</td><td class="pass">PASS</td></tr>
+    <tr><td>S7</td><td>VRAM participants are immune from TTL eviction</td><td class="pass">PASS</td></tr>
+    <tr><td>S8</td><td>Non-participant doesn't trigger pressure eviction of others</td><td class="pass">PASS</td></tr>
+    <tr><td>S9</td><td>Non-participants cannot be evicted under pressure</td><td class="pass">PASS</td></tr>
+  </tbody>
+</table>
+
+<div class="scenario">
+  <h3>S1 — Non-participant TTL eviction <span class="verdict">PASS</span></h3>
+  <p>Container: <code>noparti</code> (no <code>peak_vram_mb</code>, no <code>priority</code>). <code>session_duration=6s</code>.</p>
+  <p>Trigger blocking start → HTTP 200 → <code>noparti</code> in running set. Wait 12 s. Result: running set empty. Non-participants are still subject to time-based eviction.</p>
+</div>
+
+<div class="scenario">
+  <h3>S2 — Single participant, no eviction <span class="verdict">PASS</span></h3>
+  <p>Container <code>a</code> (peak=2000, priority=10). Trigger → HTTP 200 → <code>a</code> running. Trivial budget fit, no eviction.</p>
+</div>
+
+<div class="scenario">
+  <h3>S3 — Multiple participants fit <span class="verdict">PASS</span></h3>
+  <p>Containers <code>a</code> (2000/10), <code>b</code> (2000/20), <code>c</code> (3000/30). Total declared = 7000 ≤ 7500 (8000 − 500 headroom). All three loaded simultaneously, no evictions.</p>
+</div>
+
+<div class="scenario">
+  <h3>S4 — Eviction by lowest priority <span class="verdict">PASS</span></h3>
+  <p>Pre-loaded: <code>a</code> (2000/10), <code>b</code> (2000/20), <code>c</code> (3000/30). Used = 7000, free = 1000. Request <code>d</code> (peak=2500, priority=40). Need 2500+500 = 3000. Deficit = 2000. Candidates ordered by priority: <code>a</code> → <code>b</code> → <code>c</code>. Evicting <code>a</code> frees 2000. New free = 3000. Single eviction suffices.</p>
+  <p>Final running set: <code>b, c, d</code>. End-to-end latency for the <code>d</code> request: ≈ 6.45 s, mostly nginx healthcheck startup; eviction itself is sub-second.</p>
+  <pre>INF sablier/instance_request.go:185 evicting instance for VRAM pressure
+    victim=sab-test-a for=sab-test-d
+DBG docker/events.go:100 event received Type:container Action:die
+    Actor.Attributes.name=sab-test-a</pre>
+</div>
+
+<div class="scenario">
+  <h3>S5 — Tie-break by oldest <code>LastUsed</code> <span class="verdict">PASS</span></h3>
+  <p>Four containers, all priority=50. Sequence: load <code>old</code>, then <code>new</code>, then <code>fresh</code> (with 2 s gaps so <code>LastUsed</code> differs). Loading <code>fresh</code> already triggers an eviction because 3×3000 = 9000 &gt; 8000. Sablier evicts the oldest (<code>old</code>).</p>
+  <p>Then load <code>extra</code> (4000). Need 4500; free = 8000 − 6000 = 2000. Deficit 2500. Candidates <code>new</code> (older) → <code>fresh</code>. Pick <code>new</code>. Frees 3000. Final running set: <code>fresh, extra</code>.</p>
+</div>
+
+<div class="scenario">
+  <h3>S6 — Refusal of impossible request <span class="verdict">PASS</span></h3>
+  <p>Container <code>huge</code> (peak=20000) against budget 8000. HTTP 500 returned with body:</p>
+  <pre>{
+  "detail": "sab-test-huge: insufficient VRAM and no further eviction candidates: need 20500 MB (incl 500 headroom), can free at most 8000 MB",
+  "status": 500,
+  "title": "Internal Server Error"
+}</pre>
+  <p>No container started. <code>pendingReserve</code> not mutated (the manager refused before recording state).</p>
+</div>
+
+<div class="scenario">
+  <h3>S7 — Participants immune from TTL <span class="verdict">PASS</span></h3>
+  <p>Container <code>p</code> (peak=2000, priority=50). <code>session_duration=3s</code> (deliberately short). Started successfully, then waited 10 s — well past the requested session duration. Participant <strong>still running</strong>. The TTL bypass via the 100-year sentinel works: only pressure (or external means) can stop a participant.</p>
+</div>
+
+<div class="scenario">
+  <h3>S8 — Non-participants don't trigger pressure <span class="verdict">PASS</span></h3>
+  <p>Pre-loaded: <code>p1</code> (4000/10), <code>p2</code> (3000/50). Used = 7000. Trigger <code>noparti</code> (no peak). Sablier's pre-start path treats peak=0 as "no admission needed" — <code>ensureVRAMAdmission</code> returns nil immediately. No <code>Plan</code> call, no eviction.</p>
+  <p>Final running set: <code>noparti, p1, p2</code>.</p>
+</div>
+
+<div class="scenario">
+  <h3>S9 — Non-participants are immune from being evicted under pressure <span class="verdict">PASS</span></h3>
+  <p>Pre-loaded: <code>noparti</code> (no peak), <code>p1</code> (4000/10), <code>p2</code> (3500/20). Participant total = 7500. Free = 500. Trigger <code>newp</code> (1000/100). Need 1500. Deficit 1000.</p>
+  <p>Candidate filter explicitly excludes <code>peak_vram_mb=0</code> instances, so <code>noparti</code> is invisible to the eviction algorithm even with priority=0. Picks <code>p1</code> (lowest priority among participants). Frees 4000.</p>
+  <p>Final running set: <code>noparti, p2, newp</code>. <code>p1</code> evicted, <code>noparti</code> retained. This is the most important property for users with mixed AI / non-AI workloads on the same Sablier — only opt-in containers get pulled out from under requests.</p>
+</div>
+
+<h2 id="gaps">Things not yet covered</h2>
+
+<ul>
+  <li><strong>Concurrent request bursts.</strong> Unit-tested via <code>TestVRAM_ConcurrentReservesDoNotDoubleCount</code>, but no integration-level "fire 5 simultaneous starts" scenario. <code>Plan</code> is fully serialised under one mutex, so a regression would be obvious; an end-to-end test would still build confidence.</li>
+  <li><strong>Model-server warmup window.</strong> The <code>pendingReserve</code> entry is cleared when <code>provider.InstanceStart</code> returns. If a model server takes additional seconds <em>after</em> <code>InstanceStart</code> returns to actually load weights into VRAM, a follow-up request in that window will see <code>available</code> as if the new container had already consumed its peak. This is the conservative direction (no over-allocation), so it's safe, but it can cause unnecessary evictions for back-to-back requests against fast-starting / slow-loading model servers. Workaround: bump <code>headroom_mb</code> to absorb the overlap, or add a future <code>--vram.warmup-grace=Ns</code> knob.</li>
+  <li><strong>Multi-victim cascade where one stop fails.</strong> If the first eviction stop succeeds but the second fails, <code>ensureVRAMAdmission</code> rolls back the new reservation (<code>AbortReserve</code>) and <code>ConfirmFreed</code>s the in-flight victim, but the previously-stopped victim is already gone. The user can retry; no leak. Docker's <code>InstanceStop</code> proved reliable enough that this didn't manifest, but a real provider integration test should cover it.</li>
+  <li><strong>K8s / Swarm / Podman</strong> — only Docker exercised end-to-end. Label parsing is shared across providers (<code>PopulateEnabledAndGroup</code>) and the <code>Provider</code> interface is unchanged, so the behaviour should be portable, but a smoke test on each is worth doing before claiming generic support.</li>
+  <li><strong>Valkey backend with VRAM enabled</strong> — startup correctly fails fast with <code>ErrListUnsupported</code> by code inspection. No live valkey run, but the path is small.</li>
+</ul>
+
+<h2 id="reproducing">Reproducing</h2>
+
+<h3>Prerequisites</h3>
+<ul>
+  <li>Linux host with Docker installed and running.</li>
+  <li>Go 1.26 or newer (matches <code>go.mod</code>).</li>
+  <li>The <code>nginx:alpine</code> image will be pulled on first run; no other images required.</li>
+  <li>The scripts manage <code>sab-test-*</code> Docker containers — make sure no other containers with that name prefix exist on the host.</li>
+</ul>
+
+<h3>Running locally</h3>
+
+<pre># From the repo root:
+go build -buildvcs=false -o ./bin/sablier ./cmd/sablier
+
+cd examples/opinionated-single-host/integration-tests
+./run.sh</pre>
+
+<p>The scripts assume Sablier is at <code>./bin/sablier</code> relative to the
+repo root. Override with <code>SABLIER_BIN=/path/to/sablier ./run.sh</code>
+if you've built it elsewhere.</p>
+
+<h3>Running on a remote host</h3>
+
+<pre># Push the source up:
+rsync -az ./ user@server.example.com:~/sablier/
+
+# Build and test in one shot:
+ssh user@server.example.com '
+  cd ~/sablier
+  go build -buildvcs=false -o ./bin/sablier ./cmd/sablier
+  ./examples/opinionated-single-host/integration-tests/run.sh
+'</pre>
+
+<h3>Output</h3>
+
+<p>Each scenario prints <code>&gt;&gt;&gt; SCENARIO PASS</code> or
+<code>&gt;&gt;&gt; SCENARIO FAIL</code>. Final summary at the bottom shows
+totals; the script's exit code is the number of failures. Sablier itself
+logs to <code>/tmp/sablier.log</code> for post-mortem inspection.</p>
+
+<h3>Resetting between runs</h3>
+
+<p>The harness cleans up between scenarios automatically. If a run is
+killed mid-scenario and leaves residue, reset by hand:</p>
+
+<pre># Kill any leftover sablier processes
+pkill -f 'sablier start' || true
+
+# Remove any sab-test-* containers
+for c in $(docker ps -aq --filter "name=^/sab-test-"); do
+  docker rm -f "$c"
+done</pre>
+
+<h3>Scenario coverage</h3>
+
+<table>
+  <thead><tr><th>#</th><th>Property under test</th></tr></thead>
+  <tbody>
+    <tr><td>S1</td><td>Non-participants are TTL-evicted (existing time-based behaviour)</td></tr>
+    <tr><td>S2</td><td>Single participant within budget loads with no eviction</td></tr>
+    <tr><td>S3</td><td>Three participants fitting the budget all stay loaded</td></tr>
+    <tr><td>S4</td><td>Pressure evicts the lowest-priority participant first</td></tr>
+    <tr><td>S5</td><td>Tie-break by oldest <code>LastUsed</code> when priorities are equal</td></tr>
+    <tr><td>S6</td><td>A request exceeding total VRAM is refused with HTTP 500 and a clear message</td></tr>
+    <tr><td>S7</td><td>VRAM participants are immune from TTL eviction</td></tr>
+    <tr><td>S8</td><td>Non-participants don't trigger pressure eviction of others</td></tr>
+    <tr><td>S9</td><td>Non-participants can't be evicted by pressure</td></tr>
+  </tbody>
+</table>
+
+<p>Note: these scripts test the eviction policy in isolation by running
+the Sablier binary directly. They are <em>separate</em> from the full
+nginx + Sablier opinionated stack at
+<code>examples/opinionated-single-host/</code>; the stack is the
+production deployment shape, the scripts are for verifying the algorithm.</p>
+
+<h2 id="artefacts">Build artefacts</h2>
+
+<ul>
+  <li>Sablier binary (when running tests directly): <code>./bin/sablier</code> (built via <code>go build -buildvcs=false -o ./bin/sablier ./cmd/sablier</code>)</li>
+  <li>Sablier image (when running the opinionated stack): <code>sablier:vram-dev</code> (built via <code>docker build -f build/Dockerfile.dev -t sablier:vram-dev .</code>)</li>
+  <li>Sablier log (when running tests directly): <code>/tmp/sablier.log</code></li>
+  <li>Test driver: <code>examples/opinionated-single-host/integration-tests/run.sh</code></li>
+</ul>
+
+<h2 id="recommendation">Recommendation</h2>
+
+<p>Functionally correct against all designed scenarios with no observed defects in the eviction policy. Ready for code review and broader functional / load testing on a real GPU host. Two areas warrant follow-up before production:</p>
+
+<ol>
+  <li><strong>Confirm <code>provider.InstanceStop</code> is synchronous on every backend you use.</strong> Verified for Docker (it <code>ContainerWait</code>s on <code>WaitConditionNotRunning</code>). K8s / Swarm / Podman not verified end-to-end.</li>
+  <li><strong>Decide on the model-server warmup grace policy</strong> — keep <code>pendingReserve</code> until <code>InstanceStart</code> returns (today), or extend it via a <code>--vram.warmup-grace=Ns</code> config so slow-loading model servers don't get unnecessarily evicted by races.</li>
+</ol>
+
+<p class="footnote">End of report.</p>
+
+</main>
+</body>
+</html>

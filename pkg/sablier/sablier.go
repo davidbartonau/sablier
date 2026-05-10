@@ -19,6 +19,11 @@ type Sablier struct {
 	pendingMu     sync.Mutex
 	pendingStarts map[string]*pendingStart
 
+	// vram is non-nil when VRAM-aware eviction is enabled. When nil, the
+	// pre-existing time-only eviction policy applies and starts proceed
+	// without any pressure check.
+	vram *VRAMManager
+
 	// BlockingRefreshFrequency is the frequency at which the instances are checked
 	// against the provider. Defaults to 5 seconds.
 	BlockingRefreshFrequency time.Duration
@@ -58,4 +63,16 @@ func (s *Sablier) SetGroups(groups map[string][]string) {
 
 func (s *Sablier) RemoveInstance(ctx context.Context, name string) error {
 	return s.sessions.Delete(ctx, name)
+}
+
+// SetVRAMManager wires a VRAMManager into Sablier. Pass nil to disable
+// VRAM-aware eviction (the default after construction).
+func (s *Sablier) SetVRAMManager(m *VRAMManager) {
+	s.vram = m
+}
+
+// VRAMManager returns the configured VRAMManager, or nil when the feature is
+// disabled.
+func (s *Sablier) VRAMManager() *VRAMManager {
+	return s.vram
 }

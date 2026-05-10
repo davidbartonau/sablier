@@ -39,5 +39,10 @@
       "DefaultTimeout": 3600000000000,
       "DefaultRefreshFrequency": 3600000000000
     }
+  },
+  "VRAM": {
+    "Enabled": false,
+    "TotalMB": 0,
+    "HeadroomMB": 0
   }
 }

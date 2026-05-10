@@ -1,0 +1,24 @@
+# Multi-stage Dockerfile that builds Sablier from source. Used by the
+# opinionated single-host setup; CI continues to use the existing scratch-
+# based Dockerfile with a prebuilt binary.
+#
+# Note: runs as root (matches the upstream image). Sablier needs read/write
+# access to /var/run/docker.sock; matching that across hosts via a non-root
+# user with a host-specific GID is fragile, so we keep the simpler approach.
+
+FROM golang:1.26 AS build
+WORKDIR /src
+
+# Cache deps independently of source.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o /out/sablier ./cmd/sablier
+
+FROM gcr.io/distroless/static
+COPY --from=build /out/sablier /bin/sablier
+COPY --from=build /src/build/sablier.yaml /etc/sablier/sablier.yaml
+EXPOSE 10000
+ENTRYPOINT ["/bin/sablier"]
+CMD ["--configFile=/etc/sablier/sablier.yaml", "start"]

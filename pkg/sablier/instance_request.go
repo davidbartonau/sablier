@@ -81,6 +81,13 @@ func (s *Sablier) requestStart(ctx context.Context, name string) (InstanceInfo, 
 	}
 	info.Status = InstanceStatusStarting
 
+	// VRAM admission: plan and apply any evictions before claiming the
+	// pendingStarts slot, so a refusal here doesn't leave a half-registered
+	// entry that future requests would skip past.
+	if err := s.ensureVRAMAdmission(ctx, name, info.PeakVRAMMB); err != nil {
+		return InstanceInfo{}, err
+	}
+
 	// Second critical section: register the pending entry. Re-check in case
 	// another goroutine raced past the first unlock and registered first.
 	s.pendingMu.Lock()
@@ -94,6 +101,11 @@ func (s *Sablier) requestStart(ctx context.Context, name string) (InstanceInfo, 
 			s.l.DebugContext(ctx, "instance start already in progress (post-inspect race)", slog.String("instance", name))
 			existingInfo := existing.info
 			s.pendingMu.Unlock()
+			// We made a VRAM reservation that nobody will consume because
+			// the racing goroutine owns the start. Release it.
+			if s.vram != nil {
+				s.vram.AbortReserve(name)
+			}
 			return existingInfo, nil
 		}
 	}
@@ -108,22 +120,94 @@ func (s *Sablier) requestStart(ctx context.Context, name string) (InstanceInfo, 
 	go func() {
 		defer cancel()
 		defer close(ps.done)
+		// Released via ConfirmLoaded on success; the deferred abort below
+		// covers errors and panics so a reservation cannot leak.
+		var loaded bool
+		defer func() {
+			if !loaded && s.vram != nil {
+				s.vram.AbortReserve(name)
+			}
+		}()
+
 		if err := s.provider.InstanceStart(startCtx, name); err != nil {
 			ps.err = err
 			s.l.Error("async instance start failed", slog.String("instance", name), slog.Any("error", err))
-		} else {
-			s.l.InfoContext(ctx, "instance is ready", slog.String("instance", name))
-			// Success — clean up immediately so the entry doesn't linger
-			s.pendingMu.Lock()
-			// Only delete if ps is still the current entry (not replaced by a retry)
-			if current, ok := s.pendingStarts[name]; ok && current == ps {
-				delete(s.pendingStarts, name)
-			}
-			s.pendingMu.Unlock()
+			return
 		}
+
+		s.l.InfoContext(ctx, "instance is ready", slog.String("instance", name))
+		if s.vram != nil {
+			s.vram.ConfirmLoaded(name)
+		}
+		loaded = true
+
+		// Success — clean up immediately so the entry doesn't linger
+		s.pendingMu.Lock()
+		// Only delete if ps is still the current entry (not replaced by a retry)
+		if current, ok := s.pendingStarts[name]; ok && current == ps {
+			delete(s.pendingStarts, name)
+		}
+		s.pendingMu.Unlock()
 	}()
 
 	return info, nil
+}
+
+// ensureVRAMAdmission plans and executes any evictions required to fit a new
+// reservation of peakMB for `name`. It is a no-op when VRAM management is
+// disabled or the instance does not participate (peakMB == 0).
+//
+// On return, either:
+//   - a reservation has been recorded and any victims have been stopped and
+//     deleted from the store (the caller should proceed to start `name`), or
+//   - no state has changed and an error is returned (the caller should
+//     reject the request).
+func (s *Sablier) ensureVRAMAdmission(ctx context.Context, name string, peakMB uint64) error {
+	if s.vram == nil || peakMB == 0 {
+		return nil
+	}
+
+	loaded, err := s.sessions.List(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot list loaded instances for VRAM planning: %w", err)
+	}
+
+	victims, err := s.vram.Plan(name, peakMB, loaded)
+	if err != nil {
+		s.l.WarnContext(ctx, "vram admission refused",
+			slog.String("instance", name),
+			slog.Uint64("peak_mb", peakMB),
+			slog.Any("error", err))
+		return err
+	}
+
+	for _, v := range victims {
+		s.l.InfoContext(ctx, "evicting instance for VRAM pressure",
+			slog.String("victim", v),
+			slog.String("for", name))
+		if stopErr := s.provider.InstanceStop(ctx, v); stopErr != nil {
+			// Eviction stop failed. Roll back our reservations so the
+			// system stays consistent and surface the error.
+			s.l.ErrorContext(ctx, "vram eviction stop failed",
+				slog.String("victim", v),
+				slog.Any("error", stopErr))
+			s.vram.AbortReserve(name)
+			// Confirm-freed for *this* victim so its slot doesn't leak; we
+			// don't know the actual VRAM state for victims we already
+			// stopped successfully, but those entries will be cleaned by
+			// the deferred event-driven RemoveInstance path.
+			s.vram.ConfirmFreed(v)
+			return fmt.Errorf("eviction stop failed for %s: %w", v, stopErr)
+		}
+		if delErr := s.sessions.Delete(ctx, v); delErr != nil {
+			s.l.WarnContext(ctx, "could not delete evicted instance from store",
+				slog.String("victim", v),
+				slog.Any("error", delErr))
+		}
+		s.vram.ConfirmFreed(v)
+	}
+
+	return nil
 }
 
 func (s *Sablier) InstanceRequest(ctx context.Context, name string, duration time.Duration) (InstanceInfo, error) {
@@ -164,12 +248,31 @@ func (s *Sablier) InstanceRequest(ctx context.Context, name string, duration tim
 		}
 	}
 
-	s.l.DebugContext(ctx, "set expiration for instance", slog.String("instance", name), slog.Duration("expiration", duration))
+	// VRAM participants opt out of TTL-based eviction. Once a container
+	// declares peak_vram_mb (and VRAM management is enabled), pressure is
+	// the only signal that should stop it: the user has explicitly accepted
+	// the cost of keeping the container loaded indefinitely until VRAM is
+	// needed elsewhere. Override the request's session_duration with a
+	// far-future sentinel so the TTL machinery effectively never fires.
+	storeDuration := duration
+	if s.vram != nil && state.PeakVRAMMB > 0 {
+		storeDuration = vramParticipantTTL
+		s.l.DebugContext(ctx, "vram participant: TTL bypassed", slog.String("instance", name))
+	} else {
+		s.l.DebugContext(ctx, "set expiration for instance", slog.String("instance", name), slog.Duration("expiration", duration))
+	}
 
-	err = s.sessions.Put(ctx, state, duration)
+	err = s.sessions.Put(ctx, state, storeDuration)
 	if err != nil {
 		s.l.ErrorContext(ctx, "could not put instance to store, will not expire", slog.Any("error", err), slog.String("instance", state.Name))
 		return InstanceInfo{}, fmt.Errorf("could not put instance to store: %w", err)
 	}
 	return state, nil
 }
+
+// vramParticipantTTL is the duration recorded in the store for instances
+// that opt into VRAM management. It must be long enough that no realistic
+// system uptime will reach it (so OnInstanceExpired never fires for
+// participants) and short enough that time arithmetic does not overflow.
+// 100 years comfortably satisfies both.
+const vramParticipantTTL = 100 * 365 * 24 * time.Hour

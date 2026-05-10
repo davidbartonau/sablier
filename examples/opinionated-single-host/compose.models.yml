@@ -1,0 +1,81 @@
+# Declarative model containers for the opinionated stack.
+#
+# Why a separate compose file?
+#   These containers must exist (so Sablier can find them) but stay
+#   `Stopped` until Sablier wakes them. Putting them in the main
+#   compose file would mean `docker compose up` starts everything,
+#   defeating the demand-start design. Keep them in their own file
+#   and bring them up with `--no-start`.
+#
+# Usage:
+#   # one-time, after the main stack is up:
+#   docker compose -f compose.models.yml up --no-start
+#
+#   # to update a model definition (e.g. tweak peak/priority):
+#   docker compose -f compose.models.yml up --no-start --force-recreate
+#
+#   # to remove all model containers:
+#   docker compose -f compose.models.yml down
+#
+# Replace the mock-model image with your real model server's image
+# (vLLM, faster-whisper-server, your custom container) when wiring
+# this up for production. The labels and healthcheck shape are what
+# Sablier cares about; the image is yours.
+
+name: sablier-models
+
+x-model: &model-defaults
+  image: mock-model:latest
+  networks: [sablier-net]
+  restart: "no"
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/health >/dev/null 2>&1 || exit 1"]
+    interval: 1s
+    timeout: 2s
+    retries: 3
+    start_period: 1s
+
+services:
+  whisper-test:
+    <<: *model-defaults
+    container_name: whisper-test
+    environment:
+      MODEL_NAME: whisper-test
+      STARTUP_SECONDS: "3"
+      INFERENCE_SECONDS: "0.5"
+    labels:
+      sablier.enable: "true"
+      sablier.group: "models"
+      sablier.peak_vram_mb: "2000"
+      sablier.priority: "10"
+
+  embed-test:
+    <<: *model-defaults
+    container_name: embed-test
+    environment:
+      MODEL_NAME: embed-test
+      STARTUP_SECONDS: "5"
+      INFERENCE_SECONDS: "0.2"
+    labels:
+      sablier.enable: "true"
+      sablier.group: "models"
+      sablier.peak_vram_mb: "4000"
+      sablier.priority: "50"
+
+  llm-test:
+    <<: *model-defaults
+    container_name: llm-test
+    environment:
+      MODEL_NAME: llm-test
+      STARTUP_SECONDS: "8"
+      INFERENCE_SECONDS: "1.5"
+    labels:
+      sablier.enable: "true"
+      sablier.group: "models"
+      sablier.peak_vram_mb: "5000"
+      sablier.priority: "80"
+
+networks:
+  sablier-net:
+    name: sablier-net
+    external: true

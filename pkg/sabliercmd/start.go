@@ -56,6 +56,22 @@ func Start(ctx context.Context, conf config.Config) error {
 	s := sablier.New(logger, store, provider)
 	s.BlockingRefreshFrequency = conf.Strategy.Blocking.DefaultRefreshFrequency
 
+	if conf.VRAM.Enabled {
+		if conf.VRAM.TotalMB == 0 {
+			return fmt.Errorf("vram.enabled=true requires vram.total-mb to be set")
+		}
+		// Verify the store can enumerate loaded instances. Eviction needs
+		// List(); refusing to start with a clear error is friendlier than
+		// silently degrading to no eviction.
+		if _, err := store.List(ctx); err != nil {
+			return fmt.Errorf("VRAM-aware eviction requires a store backend that supports List: %w", err)
+		}
+		s.SetVRAMManager(sablier.NewVRAMManager(conf.VRAM.TotalMB, conf.VRAM.HeadroomMB))
+		logger.InfoContext(ctx, "vram-aware eviction enabled",
+			slog.Uint64("total_mb", conf.VRAM.TotalMB),
+			slog.Uint64("headroom_mb", conf.VRAM.HeadroomMB))
+	}
+
 	groups, err := provider.InstanceGroups(ctx)
 	if err != nil {
 		logger.WarnContext(ctx, "initial group scan failed", slog.Any("reason", err))

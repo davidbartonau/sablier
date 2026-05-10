@@ -1,0 +1,49 @@
+# docker-compose.yml — opinionated single-host Sablier stack.
+#
+# Two services: Sablier (the lifecycle manager) and nginx (the reverse
+# proxy that fronts your model containers).
+#
+# Model containers are NOT defined here. Create them separately
+# (`docker create ...` or a second compose file with `--no-start`) so they
+# exist in Docker's database but stay stopped until Sablier wakes them.
+# That separation reflects the actual deployment lifecycle: model
+# containers churn rarely; the stack churns even less rarely.
+
+name: sablier-stack
+
+services:
+  sablier:
+    image: sablier:vram-dev
+    container_name: sablier
+    restart: unless-stopped
+    networks: [sablier-net]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - start
+      - --provider.name=docker
+      - --provider.auto-stop-on-startup=true
+      - --logging.level=info
+      - --vram.enabled
+      - --vram.total-mb=8000
+      - --vram.headroom-mb=500
+      - --sessions.expiration-interval=2s
+      - --strategy.blocking.default-timeout=120s
+      - --strategy.blocking.default-refresh-frequency=500ms
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: sablier-nginx
+    restart: unless-stopped
+    depends_on: [sablier]
+    networks: [sablier-net]
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+
+networks:
+  sablier-net:
+    driver: bridge
+    name: sablier-net

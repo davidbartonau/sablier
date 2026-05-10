@@ -71,6 +71,21 @@ func (mr *MockStoreMockRecorder) Get(arg0, arg1 any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Get", reflect.TypeOf((*MockStore)(nil).Get), arg0, arg1)
 }
 
+// List mocks base method.
+func (m *MockStore) List(arg0 context.Context) ([]sablier.LoadedInstance, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "List", arg0)
+	ret0, _ := ret[0].([]sablier.LoadedInstance)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// List indicates an expected call of List.
+func (mr *MockStoreMockRecorder) List(arg0 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "List", reflect.TypeOf((*MockStore)(nil).List), arg0)
+}
+
 // OnExpire mocks base method.
 func (m *MockStore) OnExpire(arg0 context.Context, arg1 func(string)) error {
 	m.ctrl.T.Helper()

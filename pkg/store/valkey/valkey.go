@@ -64,6 +64,14 @@ func (v *ValKey) Delete(ctx context.Context, s string) error {
 	return v.Client.Do(ctx, v.Client.B().Del().Key(s).Build()).Error()
 }
 
+func (v *ValKey) List(_ context.Context) ([]sablier.LoadedInstance, error) {
+	// Valkey-backed enumeration is not implemented: it would require SCAN +
+	// per-key PTTL and a separate timestamp index. VRAM-aware eviction is
+	// gated on this method, so startup will refuse to enable the feature
+	// against the valkey backend.
+	return nil, sablier.ErrListUnsupported
+}
+
 func (v *ValKey) OnExpire(ctx context.Context, f func(string)) error {
 	go func() {
 		err := v.Client.Receive(ctx, v.Client.B().Psubscribe().Pattern("__key*__:*").Build(), func(msg valkey.PubSubMessage) {

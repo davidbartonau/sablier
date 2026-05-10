@@ -1,5 +1,9 @@
 ![Sablier Banner](https://raw.githubusercontent.com/sablierapp/artwork/refs/heads/main/horizontal/sablier-horizontal-color.png)
 
+> **This is an opinionated fork.** It adds memory-pressure-aware (VRAM) eviction so a small fixed set of GPU model containers can share a single host without thrashing: containers stay loaded as long as the declared peak fits within a configured budget, and only get evicted when an incoming request actually needs the space, by lowest priority first. Containers that opt in (via the `sablier.peak_vram_mb` label) are exempt from time-based eviction — pressure is the only signal that stops them. If you have one Docker host running Whisper / LLM / embedding model containers behind nginx, see **[OPINIONATED_SETUP.html](./OPINIONATED_SETUP.html)** for the recommended end-to-end configuration and **[VRAM_TEST_REPORT.html](./VRAM_TEST_REPORT.html)** for the design and verification of the eviction policy. The rest of this README is the upstream documentation.
+
+---
+
 [![Go Report Card](https://goreportcard.com/badge/github.com/sablierapp/sablier)](https://goreportcard.com/report/github.com/sablierapp/sablier)
 [![Discord](https://img.shields.io/discord/1298488955947454464?logo=discord&logoColor=5865F2&cacheSeconds=1&link=http%3A%2F%2F)](https://discord.gg/WXYp59KeK9)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sablierapp/sablier/badge)](https://scorecard.dev/viewer/?uri=github.com/sablierapp/sablier)
